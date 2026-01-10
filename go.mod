@@ -1,12 +1,12 @@
 module github.com/KostyaEsmukov/smtp_to_telegram
 
-go 1.24.0
+go 1.24.3
 
 require (
 	github.com/docker/go-units v0.5.0
 	github.com/flashmob/go-guerrilla v1.6.1
-	github.com/jhillyerd/enmime v1.3.0
-	github.com/stretchr/testify v1.8.4
+	github.com/jhillyerd/enmime/v2 v2.2.0
+	github.com/stretchr/testify v1.10.0
 	github.com/urfave/cli/v2 v2.27.7
 	gopkg.in/gomail.v2 v2.0.0-20160411212932-81ebce5c23df
 )
@@ -22,7 +22,7 @@ require (
 	github.com/fatih/color v1.18.0 // indirect
 	github.com/go-sql-driver/mysql v1.4.1 // indirect
 	github.com/gogs/chardet v0.0.0-20211120154057-b7413eaefb8f // indirect
-	github.com/jaytaylor/html2text v0.0.0-20230321000545-74c2419ad056 // indirect
+	github.com/inbucket/html2text v1.0.0 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mattn/go-runewidth v0.0.19 // indirect
