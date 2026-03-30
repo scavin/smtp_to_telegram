@@ -9,6 +9,7 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/http"
+	stdmail "net/mail"
 	"net/url"
 	"os"
 	"os/signal"
@@ -21,7 +22,7 @@ import (
 	"github.com/flashmob/go-guerrilla"
 	"github.com/flashmob/go-guerrilla/backends"
 	"github.com/flashmob/go-guerrilla/log"
-	"github.com/flashmob/go-guerrilla/mail"
+	gmail "github.com/flashmob/go-guerrilla/mail"
 	"github.com/jhillyerd/enmime/v2"
 	"github.com/urfave/cli/v2"
 )
@@ -39,6 +40,9 @@ type SmtpConfig struct {
 	smtpListen          string
 	smtpPrimaryHost     string
 	smtpMaxEnvelopeSize int64
+	authToken           string
+	authUsername        string
+	authPassword        string
 	logLevel            string
 }
 
@@ -105,6 +109,9 @@ func main() {
 			smtpListen:          c.String("smtp-listen"),
 			smtpPrimaryHost:     c.String("smtp-primary-host"),
 			smtpMaxEnvelopeSize: smtpMaxEnvelopeSize,
+			authToken:           c.String("auth-token"),
+			authUsername:        c.String("auth-username"),
+			authPassword:        c.String("auth-password"),
 			logLevel:            c.String("log-level"),
 		}
 		forwardedAttachmentMaxSize, err := units.FromHumanSize(c.String("forwarded-attachment-max-size"))
@@ -153,6 +160,21 @@ func main() {
 			Usage:   "Max size of an incoming Email. Examples: 5k, 10m.",
 			Value:   "50m",
 			EnvVars: []string{"ST_SMTP_MAX_ENVELOPE_SIZE"},
+		},
+		&cli.StringFlag{
+			Name:    "auth-token",
+			Usage:   "SMTP auth: shared token expected in X-SMTP-To-Telegram-Token",
+			EnvVars: []string{"ST_AUTH_TOKEN"},
+		},
+		&cli.StringFlag{
+			Name:    "auth-username",
+			Usage:   "SMTP auth: username expected in X-SMTP-To-Telegram-Username",
+			EnvVars: []string{"ST_AUTH_USERNAME"},
+		},
+		&cli.StringFlag{
+			Name:    "auth-password",
+			Usage:   "SMTP auth: password expected in X-SMTP-To-Telegram-Password",
+			EnvVars: []string{"ST_AUTH_PASSWORD"},
 		},
 		&cli.StringFlag{
 			Name:     "telegram-chat-ids",
@@ -232,6 +254,9 @@ func main() {
 
 func SmtpStart(
 	smtpConfig *SmtpConfig, telegramConfig *TelegramConfig) (guerrilla.Daemon, error) {
+	if err := ValidateAuthConfig(smtpConfig); err != nil {
+		return guerrilla.Daemon{}, err
+	}
 
 	cfg := &guerrilla.AppConfig{LogFile: log.OutputStdout.String(), LogLevel: smtpConfig.logLevel}
 
@@ -254,7 +279,7 @@ func SmtpStart(
 	cfg.BackendConfig = bcfg
 
 	daemon := guerrilla.Daemon{Config: cfg}
-	daemon.AddProcessor("TelegramBot", TelegramBotProcessorFactory(telegramConfig))
+	daemon.AddProcessor("TelegramBot", TelegramBotProcessorFactory(smtpConfig, telegramConfig))
 
 	logger = daemon.Log()
 
@@ -263,15 +288,16 @@ func SmtpStart(
 }
 
 func TelegramBotProcessorFactory(
+	smtpConfig *SmtpConfig,
 	telegramConfig *TelegramConfig) func() backends.Decorator {
 	return func() backends.Decorator {
 		// https://github.com/flashmob/go-guerrilla/wiki/Backends,-configuring-and-extending
 
 		return func(p backends.Processor) backends.Processor {
 			return backends.ProcessWith(
-				func(e *mail.Envelope, task backends.SelectTask) (backends.Result, error) {
+				func(e *gmail.Envelope, task backends.SelectTask) (backends.Result, error) {
 					if task == backends.TaskSaveMail {
-						err := SendEmailToTelegram(e, telegramConfig)
+						err := SendEmailToTelegram(e, smtpConfig, telegramConfig)
 						if err != nil {
 							return backends.NewResult(fmt.Sprintf("421 Error: %s", err)), err
 						}
@@ -284,8 +310,14 @@ func TelegramBotProcessorFactory(
 	}
 }
 
-func SendEmailToTelegram(e *mail.Envelope,
-	telegramConfig *TelegramConfig) error {
+func SendEmailToTelegram(
+	e *gmail.Envelope,
+	smtpConfig *SmtpConfig,
+	telegramConfig *TelegramConfig,
+) error {
+	if err := AuthorizeEmail(e, smtpConfig); err != nil {
+		return err
+	}
 
 	message, err := FormatEmail(e, telegramConfig)
 	if err != nil {
@@ -316,6 +348,45 @@ func SendEmailToTelegram(e *mail.Envelope,
 		}
 	}
 	return nil
+}
+
+func ValidateAuthConfig(smtpConfig *SmtpConfig) error {
+	hasUsername := smtpConfig.authUsername != ""
+	hasPassword := smtpConfig.authPassword != ""
+	if hasUsername != hasPassword {
+		return errors.New("both auth username and auth password must be set together")
+	}
+	return nil
+}
+
+func AuthEnabled(smtpConfig *SmtpConfig) bool {
+	return smtpConfig.authToken != "" || smtpConfig.authUsername != ""
+}
+
+func AuthorizeEmail(e *gmail.Envelope, smtpConfig *SmtpConfig) error {
+	if !AuthEnabled(smtpConfig) {
+		return nil
+	}
+
+	msg, err := stdmail.ReadMessage(e.NewReader())
+	if err != nil {
+		return fmt.Errorf("unable to parse message headers for auth: %v", err)
+	}
+
+	if smtpConfig.authToken != "" &&
+		msg.Header.Get("X-SMTP-To-Telegram-Token") == smtpConfig.authToken {
+		return nil
+	}
+
+	if smtpConfig.authUsername != "" &&
+		msg.Header.Get("X-SMTP-To-Telegram-Username") == smtpConfig.authUsername &&
+		msg.Header.Get("X-SMTP-To-Telegram-Password") == smtpConfig.authPassword {
+		return nil
+	}
+
+	return errors.New(
+		"authentication failed: provide X-SMTP-To-Telegram-Token or X-SMTP-To-Telegram-Username/X-SMTP-To-Telegram-Password",
+	)
 }
 
 func SendMessageToChat(
@@ -429,7 +500,7 @@ func SendAttachmentToChat(
 	return nil
 }
 
-func FormatEmail(e *mail.Envelope, telegramConfig *TelegramConfig) (*FormattedEmail, error) {
+func FormatEmail(e *gmail.Envelope, telegramConfig *TelegramConfig) (*FormattedEmail, error) {
 	reader := e.NewReader()
 	env, err := enmime.ReadEnvelope(reader)
 	if err != nil {

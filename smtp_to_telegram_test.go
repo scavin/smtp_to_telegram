@@ -117,6 +117,79 @@ func TestSuccessCustomFormat(t *testing.T) {
 	assert.Equal(t, exp, h.RequestMessages[0])
 }
 
+func TestAuthTokenSuccess(t *testing.T) {
+	smtpConfig := makeSmtpConfig()
+	smtpConfig.authToken = "secret-token"
+	telegramConfig := makeTelegramConfig()
+	d := startSmtp(smtpConfig, telegramConfig)
+	defer d.Shutdown()
+
+	h := NewSuccessHandler()
+	s := HttpServer(h)
+	defer s.Shutdown(context.Background())
+
+	msg := []byte(
+		"From: from@test\r\n" +
+			"To: to@test\r\n" +
+			"Subject: auth test\r\n" +
+			"X-SMTP-To-Telegram-Token: secret-token\r\n" +
+			"\r\n" +
+			"hi",
+	)
+	err := smtp.SendMail(smtpConfig.smtpListen, nil, "from@test", []string{"to@test"}, msg)
+	assert.NoError(t, err)
+	assert.Len(t, h.RequestMessages, len(strings.Split(telegramConfig.telegramChatIds, ",")))
+}
+
+func TestAuthUsernamePasswordSuccess(t *testing.T) {
+	smtpConfig := makeSmtpConfig()
+	smtpConfig.authUsername = "demo"
+	smtpConfig.authPassword = "pass123"
+	telegramConfig := makeTelegramConfig()
+	d := startSmtp(smtpConfig, telegramConfig)
+	defer d.Shutdown()
+
+	h := NewSuccessHandler()
+	s := HttpServer(h)
+	defer s.Shutdown(context.Background())
+
+	msg := []byte(
+		"From: from@test\r\n" +
+			"To: to@test\r\n" +
+			"Subject: auth test\r\n" +
+			"X-SMTP-To-Telegram-Username: demo\r\n" +
+			"X-SMTP-To-Telegram-Password: pass123\r\n" +
+			"\r\n" +
+			"hi",
+	)
+	err := smtp.SendMail(smtpConfig.smtpListen, nil, "from@test", []string{"to@test"}, msg)
+	assert.NoError(t, err)
+	assert.Len(t, h.RequestMessages, len(strings.Split(telegramConfig.telegramChatIds, ",")))
+}
+
+func TestAuthFailure(t *testing.T) {
+	smtpConfig := makeSmtpConfig()
+	smtpConfig.authToken = "secret-token"
+	telegramConfig := makeTelegramConfig()
+	d := startSmtp(smtpConfig, telegramConfig)
+	defer d.Shutdown()
+
+	err := smtp.SendMail(
+		smtpConfig.smtpListen,
+		nil,
+		"from@test",
+		[]string{"to@test"},
+		[]byte("From: from@test\r\nTo: to@test\r\n\r\nhi"),
+	)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "authentication failed")
+}
+
+func TestValidateAuthConfigRejectsPartialCredentials(t *testing.T) {
+	err := ValidateAuthConfig(&SmtpConfig{authUsername: "demo"})
+	assert.EqualError(t, err, "both auth username and auth password must be set together")
+}
+
 func TestTelegramUnreachable(t *testing.T) {
 	smtpConfig := makeSmtpConfig()
 	telegramConfig := makeTelegramConfig()
