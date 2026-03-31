@@ -905,7 +905,7 @@ func FormatEmail(e *SMTPEnvelope, telegramConfig *TelegramConfig) (*FormattedEma
 	}
 
 	if text == "" {
-		text = e.Data.String()
+		text = string(e.Data)
 	}
 
 	formattedAttachmentsDetails := ""
