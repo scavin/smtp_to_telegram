@@ -36,12 +36,37 @@ Assuming that your Email-sending software is running in docker as well,
 you can use `smtp_to_telegram:2525` as the target SMTP address.
 By default, no TLS or authentication is required.
 
-## Reducing abuse with a shared secret
+## Reducing abuse
 
-If your SMTP endpoint is being abused, you can require every message to carry
-either a shared token or a username/password pair in custom headers.
+If your SMTP endpoint is being abused, you can enable standard SMTP
+authentication with a username/password pair. This works with clients such as
+Synology DSM notifications.
 
-Token mode:
+SMTP AUTH mode:
+
+```
+docker run \
+    --name smtp_to_telegram \
+    -e ST_TELEGRAM_CHAT_IDS=<CHAT_ID1>,<CHAT_ID2> \
+    -e ST_TELEGRAM_BOT_TOKEN=<BOT_TOKEN> \
+    -e ST_AUTH_USERNAME=<USERNAME> \
+    -e ST_AUTH_PASSWORD=<PASSWORD> \
+    kostyaesmukov/smtp_to_telegram
+```
+
+Then configure your SMTP client with:
+
+```
+SMTP username: <USERNAME>
+SMTP password: <PASSWORD>
+```
+
+If authentication is configured and the SMTP credentials are missing or
+incorrect, the SMTP server rejects the message and nothing is forwarded to
+Telegram.
+
+Legacy token mode is still available for clients that can add custom mail
+headers:
 
 ```
 docker run \
@@ -57,28 +82,6 @@ Then every email must include:
 ```
 X-SMTP-To-Telegram-Token: <SHARED_TOKEN>
 ```
-
-Username/password mode:
-
-```
-docker run \
-    --name smtp_to_telegram \
-    -e ST_TELEGRAM_CHAT_IDS=<CHAT_ID1>,<CHAT_ID2> \
-    -e ST_TELEGRAM_BOT_TOKEN=<BOT_TOKEN> \
-    -e ST_AUTH_USERNAME=<USERNAME> \
-    -e ST_AUTH_PASSWORD=<PASSWORD> \
-    kostyaesmukov/smtp_to_telegram
-```
-
-Then every email must include:
-
-```
-X-SMTP-To-Telegram-Username: <USERNAME>
-X-SMTP-To-Telegram-Password: <PASSWORD>
-```
-
-If authentication is configured and the headers are missing or incorrect, the
-SMTP server rejects the message and nothing is forwarded to Telegram.
 
 The default Telegram message format is:
 

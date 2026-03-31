@@ -1,13 +1,18 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
+	stdlog "log"
 	"mime"
 	"mime/multipart"
+	"net"
 	"net/http"
 	stdmail "net/mail"
 	"net/url"
@@ -15,21 +20,18 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	units "github.com/docker/go-units"
-	"github.com/flashmob/go-guerrilla"
-	"github.com/flashmob/go-guerrilla/backends"
-	"github.com/flashmob/go-guerrilla/log"
-	gmail "github.com/flashmob/go-guerrilla/mail"
 	"github.com/jhillyerd/enmime/v2"
 	"github.com/urfave/cli/v2"
 )
 
 var (
 	Version string = "UNKNOWN_RELEASE"
-	logger  log.Logger
+	logger         = NewAppLogger()
 )
 
 const (
@@ -83,6 +85,51 @@ type FormattedAttachment struct {
 	caption  string
 	content  []byte
 	fileType int
+}
+
+type AppLogger struct {
+	logger *stdlog.Logger
+}
+
+type SMTPDaemon struct {
+	listener net.Listener
+	wg       sync.WaitGroup
+	closed   chan struct{}
+	once     sync.Once
+}
+
+type SMTPEnvelope struct {
+	MailFrom string
+	RcptTo   []string
+	Data     []byte
+}
+
+func NewAppLogger() *AppLogger {
+	return &AppLogger{
+		logger: stdlog.New(os.Stdout, "", stdlog.LstdFlags),
+	}
+}
+
+func (l *AppLogger) Info(msg string) {
+	l.logger.Printf("INFO %s", msg)
+}
+
+func (l *AppLogger) Error(msg string) {
+	l.logger.Printf("ERROR %s", msg)
+}
+
+func (l *AppLogger) Errorf(format string, args ...interface{}) {
+	l.logger.Printf("ERROR "+format, args...)
+}
+
+func (d *SMTPDaemon) Shutdown() {
+	d.once.Do(func() {
+		close(d.closed)
+		if d.listener != nil {
+			_ = d.listener.Close()
+		}
+		d.wg.Wait()
+	})
 }
 
 func GetHostname() string {
@@ -163,17 +210,17 @@ func main() {
 		},
 		&cli.StringFlag{
 			Name:    "auth-token",
-			Usage:   "SMTP auth: shared token expected in X-SMTP-To-Telegram-Token",
+			Usage:   "Legacy shared token expected in X-SMTP-To-Telegram-Token",
 			EnvVars: []string{"ST_AUTH_TOKEN"},
 		},
 		&cli.StringFlag{
 			Name:    "auth-username",
-			Usage:   "SMTP auth: username expected in X-SMTP-To-Telegram-Username",
+			Usage:   "SMTP AUTH username",
 			EnvVars: []string{"ST_AUTH_USERNAME"},
 		},
 		&cli.StringFlag{
 			Name:    "auth-password",
-			Usage:   "SMTP auth: password expected in X-SMTP-To-Telegram-Password",
+			Usage:   "SMTP AUTH password",
 			EnvVars: []string{"ST_AUTH_PASSWORD"},
 		},
 		&cli.StringFlag{
@@ -253,65 +300,31 @@ func main() {
 }
 
 func SmtpStart(
-	smtpConfig *SmtpConfig, telegramConfig *TelegramConfig) (guerrilla.Daemon, error) {
+	smtpConfig *SmtpConfig, telegramConfig *TelegramConfig) (*SMTPDaemon, error) {
 	if err := ValidateAuthConfig(smtpConfig); err != nil {
-		return guerrilla.Daemon{}, err
+		return nil, err
 	}
 
-	cfg := &guerrilla.AppConfig{LogFile: log.OutputStdout.String(), LogLevel: smtpConfig.logLevel}
-
-	cfg.AllowedHosts = []string{"."}
-
-	sc := guerrilla.ServerConfig{
-		IsEnabled:       true,
-		ListenInterface: smtpConfig.smtpListen,
-		MaxSize:         smtpConfig.smtpMaxEnvelopeSize,
+	listener, err := net.Listen("tcp", smtpConfig.smtpListen)
+	if err != nil {
+		return nil, err
 	}
-	cfg.Servers = append(cfg.Servers, sc)
 
-	bcfg := backends.BackendConfig{
-		"save_workers_size":  3,
-		"save_process":       "HeadersParser|Header|Hasher|TelegramBot",
-		"log_received_mails": true,
-		"primary_mail_host":  smtpConfig.smtpPrimaryHost,
-		"gw_save_timeout":    "600s", // Needs to be greater than ST_TELEGRAM_API_TIMEOUT_SECONDS
+	daemon := &SMTPDaemon{
+		listener: listener,
+		closed:   make(chan struct{}),
 	}
-	cfg.BackendConfig = bcfg
+	daemon.wg.Add(1)
+	go func() {
+		defer daemon.wg.Done()
+		daemon.serve(smtpConfig, telegramConfig)
+	}()
 
-	daemon := guerrilla.Daemon{Config: cfg}
-	daemon.AddProcessor("TelegramBot", TelegramBotProcessorFactory(smtpConfig, telegramConfig))
-
-	logger = daemon.Log()
-
-	err := daemon.Start()
-	return daemon, err
-}
-
-func TelegramBotProcessorFactory(
-	smtpConfig *SmtpConfig,
-	telegramConfig *TelegramConfig) func() backends.Decorator {
-	return func() backends.Decorator {
-		// https://github.com/flashmob/go-guerrilla/wiki/Backends,-configuring-and-extending
-
-		return func(p backends.Processor) backends.Processor {
-			return backends.ProcessWith(
-				func(e *gmail.Envelope, task backends.SelectTask) (backends.Result, error) {
-					if task == backends.TaskSaveMail {
-						err := SendEmailToTelegram(e, smtpConfig, telegramConfig)
-						if err != nil {
-							return backends.NewResult(fmt.Sprintf("421 Error: %s", err)), err
-						}
-						return p.Process(e, task)
-					}
-					return p.Process(e, task)
-				},
-			)
-		}
-	}
+	return daemon, nil
 }
 
 func SendEmailToTelegram(
-	e *gmail.Envelope,
+	e *SMTPEnvelope,
 	smtpConfig *SmtpConfig,
 	telegramConfig *TelegramConfig,
 ) error {
@@ -350,6 +363,337 @@ func SendEmailToTelegram(
 	return nil
 }
 
+func (d *SMTPDaemon) serve(smtpConfig *SmtpConfig, telegramConfig *TelegramConfig) {
+	for {
+		conn, err := d.listener.Accept()
+		if err != nil {
+			select {
+			case <-d.closed:
+				return
+			default:
+				logger.Errorf("SMTP accept error: %v", err)
+				continue
+			}
+		}
+
+		d.wg.Add(1)
+		go func() {
+			defer d.wg.Done()
+			defer conn.Close()
+			handleSMTPConnection(conn, smtpConfig, telegramConfig)
+		}()
+	}
+}
+
+func handleSMTPConnection(conn net.Conn, smtpConfig *SmtpConfig, telegramConfig *TelegramConfig) {
+	reader := bufio.NewReader(conn)
+	writer := bufio.NewWriter(conn)
+	session := &smtpSession{
+		conn:           conn,
+		reader:         reader,
+		writer:         writer,
+		smtpConfig:     smtpConfig,
+		telegramConfig: telegramConfig,
+	}
+	if err := session.run(); err != nil && !errors.Is(err, io.EOF) {
+		logger.Errorf("SMTP session error: %v", err)
+	}
+}
+
+type smtpSession struct {
+	conn           net.Conn
+	reader         *bufio.Reader
+	writer         *bufio.Writer
+	smtpConfig     *SmtpConfig
+	telegramConfig *TelegramConfig
+	helo           string
+	authenticated  bool
+	mailFrom       string
+	rcptTo         []string
+}
+
+func (s *smtpSession) run() error {
+	if err := s.writeResponse("220 %s ESMTP smtp_to_telegram", s.smtpConfig.smtpPrimaryHost); err != nil {
+		return err
+	}
+
+	for {
+		line, err := s.reader.ReadString('\n')
+		if err != nil {
+			return err
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" {
+			continue
+		}
+
+		cmd, arg := splitSMTPCommand(line)
+		switch cmd {
+		case "EHLO":
+			s.resetTransaction()
+			s.helo = arg
+			if err := s.writeEhloResponse(); err != nil {
+				return err
+			}
+		case "HELO":
+			s.resetTransaction()
+			s.helo = arg
+			if err := s.writeResponse("250 %s", s.smtpConfig.smtpPrimaryHost); err != nil {
+				return err
+			}
+		case "AUTH":
+			if err := s.handleAuth(arg); err != nil {
+				return err
+			}
+		case "MAIL":
+			if err := s.handleMail(arg); err != nil {
+				return err
+			}
+		case "RCPT":
+			if err := s.handleRcpt(arg); err != nil {
+				return err
+			}
+		case "DATA":
+			if err := s.handleData(); err != nil {
+				return err
+			}
+		case "RSET":
+			s.resetTransaction()
+			if err := s.writeResponse("250 OK"); err != nil {
+				return err
+			}
+		case "NOOP":
+			if err := s.writeResponse("250 OK"); err != nil {
+				return err
+			}
+		case "QUIT":
+			return s.writeResponse("221 Bye")
+		default:
+			if err := s.writeResponse("502 Command not implemented"); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func (s *smtpSession) writeEhloResponse() error {
+	lines := []string{
+		fmt.Sprintf("250-%s", s.smtpConfig.smtpPrimaryHost),
+		fmt.Sprintf("250-SIZE %d", s.smtpConfig.smtpMaxEnvelopeSize),
+		"250-8BITMIME",
+	}
+	if SMTPAuthEnabled(s.smtpConfig) {
+		lines = append(lines, "250-AUTH PLAIN LOGIN")
+	}
+	lines = append(lines, "250 PIPELINING")
+	for _, line := range lines {
+		if _, err := fmt.Fprintf(s.writer, "%s\r\n", line); err != nil {
+			return err
+		}
+	}
+	return s.writer.Flush()
+}
+
+func (s *smtpSession) writeResponse(format string, args ...interface{}) error {
+	if _, err := fmt.Fprintf(s.writer, format+"\r\n", args...); err != nil {
+		return err
+	}
+	return s.writer.Flush()
+}
+
+func (s *smtpSession) handleAuth(arg string) error {
+	if !SMTPAuthEnabled(s.smtpConfig) {
+		return s.writeResponse("502 Authentication not enabled")
+	}
+
+	parts := strings.Fields(arg)
+	if len(parts) == 0 {
+		return s.writeResponse("501 Syntax: AUTH mechanism")
+	}
+
+	switch strings.ToUpper(parts[0]) {
+	case "PLAIN":
+		return s.handleAuthPlain(parts[1:])
+	case "LOGIN":
+		return s.handleAuthLogin(parts[1:])
+	default:
+		return s.writeResponse("504 Unsupported authentication mechanism")
+	}
+}
+
+func (s *smtpSession) handleAuthPlain(args []string) error {
+	payload := ""
+	if len(args) > 0 {
+		payload = args[0]
+	} else {
+		if err := s.writeResponse("334 "); err != nil {
+			return err
+		}
+		line, err := s.reader.ReadString('\n')
+		if err != nil {
+			return err
+		}
+		payload = strings.TrimRight(line, "\r\n")
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(payload)
+	if err != nil {
+		return s.writeResponse("535 Authentication failed")
+	}
+	parts := strings.Split(string(decoded), "\x00")
+	if len(parts) < 3 {
+		return s.writeResponse("535 Authentication failed")
+	}
+	username := parts[len(parts)-2]
+	password := parts[len(parts)-1]
+	return s.finishAuth(username, password)
+}
+
+func (s *smtpSession) handleAuthLogin(args []string) error {
+	username := ""
+	if len(args) > 0 {
+		decoded, err := base64.StdEncoding.DecodeString(args[0])
+		if err != nil {
+			return s.writeResponse("535 Authentication failed")
+		}
+		username = string(decoded)
+	} else {
+		if err := s.writeResponse("334 %s", base64.StdEncoding.EncodeToString([]byte("Username:"))); err != nil {
+			return err
+		}
+		line, err := s.reader.ReadString('\n')
+		if err != nil {
+			return err
+		}
+		decoded, err := base64.StdEncoding.DecodeString(strings.TrimRight(line, "\r\n"))
+		if err != nil {
+			return s.writeResponse("535 Authentication failed")
+		}
+		username = string(decoded)
+	}
+
+	if err := s.writeResponse("334 %s", base64.StdEncoding.EncodeToString([]byte("Password:"))); err != nil {
+		return err
+	}
+	line, err := s.reader.ReadString('\n')
+	if err != nil {
+		return err
+	}
+	decoded, err := base64.StdEncoding.DecodeString(strings.TrimRight(line, "\r\n"))
+	if err != nil {
+		return s.writeResponse("535 Authentication failed")
+	}
+	return s.finishAuth(username, string(decoded))
+}
+
+func (s *smtpSession) finishAuth(username string, password string) error {
+	if username == s.smtpConfig.authUsername && password == s.smtpConfig.authPassword {
+		s.authenticated = true
+		return s.writeResponse("235 Authentication successful")
+	}
+	return s.writeResponse("535 Authentication failed")
+}
+
+func (s *smtpSession) handleMail(arg string) error {
+	if !s.authenticatedOrOpenRelay() {
+		return s.writeResponse("530 Authentication required")
+	}
+	if s.helo == "" {
+		return s.writeResponse("503 Send HELO/EHLO first")
+	}
+	if !strings.HasPrefix(strings.ToUpper(arg), "FROM:") {
+		return s.writeResponse("501 Syntax: MAIL FROM:<address>")
+	}
+	address := parseSMTPPath(arg[5:])
+	if address == "" {
+		return s.writeResponse("501 Invalid sender address")
+	}
+	s.mailFrom = address
+	s.rcptTo = nil
+	return s.writeResponse("250 OK")
+}
+
+func (s *smtpSession) handleRcpt(arg string) error {
+	if s.mailFrom == "" {
+		return s.writeResponse("503 Need MAIL before RCPT")
+	}
+	if !strings.HasPrefix(strings.ToUpper(arg), "TO:") {
+		return s.writeResponse("501 Syntax: RCPT TO:<address>")
+	}
+	address := parseSMTPPath(arg[3:])
+	if address == "" {
+		return s.writeResponse("501 Invalid recipient address")
+	}
+	s.rcptTo = append(s.rcptTo, address)
+	return s.writeResponse("250 OK")
+}
+
+func (s *smtpSession) handleData() error {
+	if len(s.rcptTo) == 0 {
+		return s.writeResponse("503 Need RCPT before DATA")
+	}
+	if err := s.writeResponse("354 End data with <CR><LF>.<CR><LF>"); err != nil {
+		return err
+	}
+
+	var data bytes.Buffer
+	for {
+		line, err := s.reader.ReadString('\n')
+		if err != nil {
+			return err
+		}
+		if line == ".\r\n" || line == ".\n" {
+			break
+		}
+		if strings.HasPrefix(line, "..") {
+			line = line[1:]
+		}
+		data.WriteString(line)
+		if int64(data.Len()) > s.smtpConfig.smtpMaxEnvelopeSize {
+			s.resetTransaction()
+			return s.writeResponse("552 Message exceeds fixed maximum message size")
+		}
+	}
+
+	envelope := &SMTPEnvelope{
+		MailFrom: s.mailFrom,
+		RcptTo:   append([]string(nil), s.rcptTo...),
+		Data:     data.Bytes(),
+	}
+	s.resetTransaction()
+	if err := SendEmailToTelegram(envelope, s.smtpConfig, s.telegramConfig); err != nil {
+		return s.writeResponse("421 Error: %s", err)
+	}
+	return s.writeResponse("250 OK")
+}
+
+func (s *smtpSession) resetTransaction() {
+	s.mailFrom = ""
+	s.rcptTo = nil
+}
+
+func (s *smtpSession) authenticatedOrOpenRelay() bool {
+	return !SMTPAuthEnabled(s.smtpConfig) || s.authenticated
+}
+
+func splitSMTPCommand(line string) (string, string) {
+	parts := strings.SplitN(line, " ", 2)
+	cmd := strings.ToUpper(parts[0])
+	if len(parts) == 1 {
+		return cmd, ""
+	}
+	return cmd, strings.TrimSpace(parts[1])
+}
+
+func parseSMTPPath(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if i := strings.Index(raw, " "); i >= 0 {
+		raw = raw[:i]
+	}
+	raw = strings.Trim(raw, "<>")
+	return strings.TrimSpace(raw)
+}
+
 func ValidateAuthConfig(smtpConfig *SmtpConfig) error {
 	hasUsername := smtpConfig.authUsername != ""
 	hasPassword := smtpConfig.authPassword != ""
@@ -359,12 +703,12 @@ func ValidateAuthConfig(smtpConfig *SmtpConfig) error {
 	return nil
 }
 
-func AuthEnabled(smtpConfig *SmtpConfig) bool {
-	return smtpConfig.authToken != "" || smtpConfig.authUsername != ""
+func SMTPAuthEnabled(smtpConfig *SmtpConfig) bool {
+	return smtpConfig.authUsername != ""
 }
 
-func AuthorizeEmail(e *gmail.Envelope, smtpConfig *SmtpConfig) error {
-	if !AuthEnabled(smtpConfig) {
+func AuthorizeEmail(e *SMTPEnvelope, smtpConfig *SmtpConfig) error {
+	if smtpConfig.authToken == "" {
 		return nil
 	}
 
@@ -373,19 +717,12 @@ func AuthorizeEmail(e *gmail.Envelope, smtpConfig *SmtpConfig) error {
 		return fmt.Errorf("unable to parse message headers for auth: %v", err)
 	}
 
-	if smtpConfig.authToken != "" &&
-		msg.Header.Get("X-SMTP-To-Telegram-Token") == smtpConfig.authToken {
-		return nil
-	}
-
-	if smtpConfig.authUsername != "" &&
-		msg.Header.Get("X-SMTP-To-Telegram-Username") == smtpConfig.authUsername &&
-		msg.Header.Get("X-SMTP-To-Telegram-Password") == smtpConfig.authPassword {
+	if msg.Header.Get("X-SMTP-To-Telegram-Token") == smtpConfig.authToken {
 		return nil
 	}
 
 	return errors.New(
-		"authentication failed: provide X-SMTP-To-Telegram-Token or X-SMTP-To-Telegram-Username/X-SMTP-To-Telegram-Password",
+		"authentication failed: provide X-SMTP-To-Telegram-Token",
 	)
 }
 
@@ -500,11 +837,11 @@ func SendAttachmentToChat(
 	return nil
 }
 
-func FormatEmail(e *gmail.Envelope, telegramConfig *TelegramConfig) (*FormattedEmail, error) {
+func FormatEmail(e *SMTPEnvelope, telegramConfig *TelegramConfig) (*FormattedEmail, error) {
 	reader := e.NewReader()
 	env, err := enmime.ReadEnvelope(reader)
 	if err != nil {
-		return nil, fmt.Errorf("%s\n\nError occurred during email parsing: %v", e, err)
+		return nil, fmt.Errorf("error occurred during email parsing: %v", err)
 	}
 	text := env.Text
 
@@ -580,7 +917,7 @@ func FormatEmail(e *gmail.Envelope, telegramConfig *TelegramConfig) (*FormattedE
 	}
 
 	fullMessageText, truncatedMessageText := FormatMessage(
-		e.MailFrom.String(),
+		e.MailFrom,
 		JoinEmailAddresses(e.RcptTo),
 		env.GetHeader("subject"),
 		text,
@@ -694,12 +1031,8 @@ func FileIsImage(contentType string) bool {
 	return false
 }
 
-func JoinEmailAddresses(a []mail.Address) string {
-	s := []string{}
-	for _, aa := range a {
-		s = append(s, aa.String())
-	}
-	return strings.Join(s, ", ")
+func JoinEmailAddresses(a []string) string {
+	return strings.Join(a, ", ")
 }
 
 func EscapeMultiLine(b []byte) string {
@@ -722,7 +1055,11 @@ func panicIfError(err error) {
 	}
 }
 
-func sigHandler(d guerrilla.Daemon) {
+func (e *SMTPEnvelope) NewReader() io.Reader {
+	return bytes.NewReader(e.Data)
+}
+
+func sigHandler(d *SMTPDaemon) {
 	signalChannel := make(chan os.Signal, 1)
 
 	signal.Notify(signalChannel,

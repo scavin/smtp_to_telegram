@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net"
@@ -12,7 +14,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/flashmob/go-guerrilla"
 	"github.com/stretchr/testify/assert"
 	"gopkg.in/gomail.v2"
 )
@@ -43,7 +44,7 @@ func makeTelegramConfig() *TelegramConfig {
 	}
 }
 
-func startSmtp(smtpConfig *SmtpConfig, telegramConfig *TelegramConfig) guerrilla.Daemon {
+func startSmtp(smtpConfig *SmtpConfig, telegramConfig *TelegramConfig) *SMTPDaemon {
 	d, err := SmtpStart(smtpConfig, telegramConfig)
 	if err != nil {
 		panic(fmt.Sprintf("start error: %s", err))
@@ -141,7 +142,7 @@ func TestAuthTokenSuccess(t *testing.T) {
 	assert.Len(t, h.RequestMessages, len(strings.Split(telegramConfig.telegramChatIds, ",")))
 }
 
-func TestAuthUsernamePasswordSuccess(t *testing.T) {
+func TestSMTPAuthPlainSuccess(t *testing.T) {
 	smtpConfig := makeSmtpConfig()
 	smtpConfig.authUsername = "demo"
 	smtpConfig.authPassword = "pass123"
@@ -153,41 +154,191 @@ func TestAuthUsernamePasswordSuccess(t *testing.T) {
 	s := HttpServer(h)
 	defer s.Shutdown(context.Background())
 
-	msg := []byte(
-		"From: from@test\r\n" +
-			"To: to@test\r\n" +
-			"Subject: auth test\r\n" +
-			"X-SMTP-To-Telegram-Username: demo\r\n" +
-			"X-SMTP-To-Telegram-Password: pass123\r\n" +
-			"\r\n" +
-			"hi",
-	)
-	err := smtp.SendMail(smtpConfig.smtpListen, nil, "from@test", []string{"to@test"}, msg)
-	assert.NoError(t, err)
+	assert.NoError(t, sendMailWithAuthPlain(
+		smtpConfig.smtpListen,
+		"demo",
+		"pass123",
+		"from@test",
+		[]string{"to@test"},
+		"Subject: auth test\r\n\r\nhi",
+	))
 	assert.Len(t, h.RequestMessages, len(strings.Split(telegramConfig.telegramChatIds, ",")))
 }
 
-func TestAuthFailure(t *testing.T) {
+func TestSMTPAuthLoginSuccess(t *testing.T) {
 	smtpConfig := makeSmtpConfig()
-	smtpConfig.authToken = "secret-token"
+	smtpConfig.authUsername = "demo"
+	smtpConfig.authPassword = "pass123"
 	telegramConfig := makeTelegramConfig()
 	d := startSmtp(smtpConfig, telegramConfig)
 	defer d.Shutdown()
 
-	err := smtp.SendMail(
+	h := NewSuccessHandler()
+	s := HttpServer(h)
+	defer s.Shutdown(context.Background())
+
+	assert.NoError(t, sendMailWithAuthLogin(
 		smtpConfig.smtpListen,
-		nil,
+		"demo",
+		"pass123",
 		"from@test",
 		[]string{"to@test"},
-		[]byte("From: from@test\r\nTo: to@test\r\n\r\nhi"),
+		"Subject: auth test\r\n\r\nhi",
+	))
+	assert.Len(t, h.RequestMessages, len(strings.Split(telegramConfig.telegramChatIds, ",")))
+}
+
+func TestSMTPAuthFailure(t *testing.T) {
+	smtpConfig := makeSmtpConfig()
+	smtpConfig.authUsername = "demo"
+	smtpConfig.authPassword = "pass123"
+	telegramConfig := makeTelegramConfig()
+	d := startSmtp(smtpConfig, telegramConfig)
+	defer d.Shutdown()
+
+	err := sendMailWithAuthPlain(
+		smtpConfig.smtpListen,
+		"demo",
+		"wrong",
+		"from@test",
+		[]string{"to@test"},
+		"Subject: auth test\r\n\r\nhi",
 	)
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "authentication failed")
+	assert.Contains(t, err.Error(), "535")
+}
+
+func TestSMTPAuthRequired(t *testing.T) {
+	smtpConfig := makeSmtpConfig()
+	smtpConfig.authUsername = "demo"
+	smtpConfig.authPassword = "pass123"
+	telegramConfig := makeTelegramConfig()
+	d := startSmtp(smtpConfig, telegramConfig)
+	defer d.Shutdown()
+
+	err := smtp.SendMail(smtpConfig.smtpListen, nil, "from@test", []string{"to@test"}, []byte("Subject: auth test\r\n\r\nhi"))
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "530")
 }
 
 func TestValidateAuthConfigRejectsPartialCredentials(t *testing.T) {
 	err := ValidateAuthConfig(&SmtpConfig{authUsername: "demo"})
 	assert.EqualError(t, err, "both auth username and auth password must be set together")
+}
+
+func sendMailWithAuthPlain(addr string, username string, password string, from string, to []string, message string) error {
+	payload := base64.StdEncoding.EncodeToString([]byte("\x00" + username + "\x00" + password))
+	return sendMailWithAuthenticatedSession(addr, "AUTH PLAIN "+payload, nil, from, to, message)
+}
+
+func sendMailWithAuthLogin(addr string, username string, password string, from string, to []string, message string) error {
+	steps := []smtpStep{
+		{command: "AUTH LOGIN", expectedCode: "334"},
+		{command: base64.StdEncoding.EncodeToString([]byte(username)), expectedCode: "334"},
+		{command: base64.StdEncoding.EncodeToString([]byte(password)), expectedCode: "235"},
+	}
+	return sendMailWithAuthenticatedSession(addr, "EHLO localhost", steps, from, to, message)
+}
+
+type smtpStep struct {
+	command      string
+	expectedCode string
+}
+
+func sendMailWithAuthenticatedSession(addr string, authLine string, steps []smtpStep, from string, to []string, message string) error {
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	reader := bufio.NewReader(conn)
+	writer := bufio.NewWriter(conn)
+
+	if err := expectSMTPCode(reader, "220"); err != nil {
+		return err
+	}
+	if err := smtpWriteLine(writer, "EHLO localhost"); err != nil {
+		return err
+	}
+	if err := expectSMTPCode(reader, "250"); err != nil {
+		return err
+	}
+	if len(steps) == 0 {
+		steps = []smtpStep{{command: authLine, expectedCode: "235"}}
+	}
+	for _, step := range steps {
+		if err := smtpWriteLine(writer, step.command); err != nil {
+			return err
+		}
+		if err := expectSMTPCode(reader, step.expectedCode); err != nil {
+			return err
+		}
+	}
+	return finishSMTPMessage(reader, writer, from, to, message)
+}
+
+func finishSMTPMessage(reader *bufio.Reader, writer *bufio.Writer, from string, to []string, message string) error {
+	if err := smtpWriteLine(writer, fmt.Sprintf("MAIL FROM:<%s>", from)); err != nil {
+		return err
+	}
+	if err := expectSMTPCode(reader, "250"); err != nil {
+		return err
+	}
+	for _, rcpt := range to {
+		if err := smtpWriteLine(writer, fmt.Sprintf("RCPT TO:<%s>", rcpt)); err != nil {
+			return err
+		}
+		if err := expectSMTPCode(reader, "250"); err != nil {
+			return err
+		}
+	}
+	if err := smtpWriteLine(writer, "DATA"); err != nil {
+		return err
+	}
+	if err := expectSMTPCode(reader, "354"); err != nil {
+		return err
+	}
+	for _, line := range strings.Split(message, "\n") {
+		if strings.HasPrefix(line, ".") {
+			line = "." + line
+		}
+		if err := smtpWriteLine(writer, strings.TrimRight(line, "\r")); err != nil {
+			return err
+		}
+	}
+	if err := smtpWriteLine(writer, "."); err != nil {
+		return err
+	}
+	if err := expectSMTPCode(reader, "250"); err != nil {
+		return err
+	}
+	_ = smtpWriteLine(writer, "QUIT")
+	_ = expectSMTPCode(reader, "221")
+	return nil
+}
+
+func smtpWriteLine(writer *bufio.Writer, line string) error {
+	if _, err := writer.WriteString(line + "\r\n"); err != nil {
+		return err
+	}
+	return writer.Flush()
+}
+
+func expectSMTPCode(reader *bufio.Reader, code string) error {
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return err
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if !strings.HasPrefix(line, code) {
+			return fmt.Errorf("unexpected SMTP response: %s", line)
+		}
+		if len(line) < 4 || line[3] != '-' {
+			return nil
+		}
+	}
 }
 
 func TestTelegramUnreachable(t *testing.T) {
